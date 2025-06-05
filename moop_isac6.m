@@ -252,7 +252,7 @@ function run_beampattern_analysis()
         fprintf('实际使用雷达流M=%d\n', M);
         
         % 生成莱斯衰落信道
-        h = generate_rician_channel(Nt, C, theta_c, rician_factor);
+        h = generate_rician_channel_standard(Nt, C, theta_c, rician_factor);
         
         % 存储所有方法的结果
         beampatterns = struct();
@@ -381,7 +381,7 @@ function run_snr_performance_analysis()
             end
             
             % 生成随机莱斯信道
-            h = generate_rician_channel(Nt, C, theta_c, rician_factor);
+            h = generate_rician_channel_standard(Nt, C, theta_c, rician_factor);
             
             % 测试所有方法
             for m = 1:length(methods)
@@ -490,7 +490,7 @@ function run_pareto_tradeoff_analysis()
         sigma2_k = ones(K,1);
         
         % 生成信道
-        h = generate_rician_channel(Nt, C, theta_c, rician_factor);
+        h = generate_rician_channel_standard(Nt, C, theta_c, rician_factor);
         
         % 计算Pareto边界
         alpha_values = linspace(0.1, 0.9, 40);
@@ -597,7 +597,7 @@ function run_capon_spectrum_analysis()
                'Position', [100+s*50, 100+s*50, 1200, 800]);
         
         % 生成信道
-        h = generate_rician_channel(Nt, C, theta_c, rician_factor);
+        h = generate_rician_channel_standard(Nt, C, theta_c, rician_factor);
         
         % 获取不同方法的波束成形解
         methods = {'Proposed', 'Radar_Only', 'MI_Constrained'};
@@ -687,7 +687,7 @@ function run_rmse_analysis()
             for mc = 1:num_monte_carlo
                 try
                     % 生成随机信道
-                    h = generate_rician_channel(Nt, C, theta_c, rician_factor);
+                    h = generate_rician_channel_standard(Nt, C, theta_c, rician_factor);
                     
                     % 获取波束成形解
                     W_opt = solve_method_beamforming(method_name, h, theta_r, ...
@@ -737,8 +737,7 @@ function run_rmse_analysis()
     fprintf('RMSE分析完成\n');
 end
 
-%% 核心优化求解函数（来自MOOP_ISAC3.m）
-
+%% 核心优化求解函数
 function [R_opt, r_opt, solve_info] = solve_complex_convex_optimization(...
     alpha, omega, xi, h, theta_r, ...
     Nt, Nr, L, PT, C, K, M, ...
@@ -788,20 +787,31 @@ function [R, feasible, cvx_info] = solve_complex_feasibility(...
     R = [];
     feasible = false;
     cvx_info = '';
-    
+
     try
+        % 参数验证和调试信息
+        fprintf('  CVX求解参数: Nt=%d, C=%d, K=%d, M=%d, r=%.4f\n', Nt, C, K, M, r);
+
         % 预计算复数导向矢量
         A_targets = zeros(Nt, K);
         for k = 1:K
             A_targets(:,k) = exp(1j*2*pi*d*(0:Nt-1)'*sin(theta_r(k)));
         end
-
+        
+        % CVX优化求解 - 完全兼容版本
         cvx_begin sdp quiet
+            cvx_precision default
+            
             % 声明复数厄米特半正定矩阵变量
             variable R(Nt, Nt, C+M) complex hermitian semidefinite
             
             minimize(0)  % 可行性问题
             
+            sum_R = zeros(Nt, Nt);
+            for n = 1:(C+M)
+                sum_R = sum_R + R(:,:,n);
+            end
+
             subject to
                 %% 1. 功率约束
                 total_power = 0;
@@ -816,11 +826,6 @@ function [R, feasible, cvx_info] = solve_complex_feasibility(...
                 for i = 1:K
                     for j = 1:K
                         if i ~= j
-                            sum_R = zeros(Nt, Nt);
-                            for n = 1:(C+M)
-                                sum_R = sum_R + R(:,:,n);
-                            end
-                            
                             cross_corr = A_targets(:,j)' * sum_R * A_targets(:,i);
                             norm(cross_corr) <= kappa;
                         end
@@ -829,8 +834,9 @@ function [R, feasible, cvx_info] = solve_complex_feasibility(...
                 
                 %% 3. 通信SINR约束  r_i >= Gamma_i + w_i * r
                 
-                Gamma = [5; 5];% SINR阈值 (dB)，转换为线性值
-                for i = 1:C
+                Gamma_dB = 5;  % 所有用户使用相同的SINR阈值 5dB
+                Gamma = 10^(Gamma_dB/10) * ones(C, 1);  % 转换为线性值并创建C个元素的数组
+                for i = 1:min(C, size(h, 2))
                     % 计算信号功率: h_i^H R_i h_i
                     signal_power = real(h(:,i)' * R(:,:,i) * h(:,i));
                     
@@ -841,17 +847,15 @@ function [R, feasible, cvx_info] = solve_complex_feasibility(...
                             interference = interference + real(h(:,i)' * R(:,:,j) * h(:,i));
                         end
                     end
-                    % 转换为线性不等式
-                    % h_i^H R_i h_i >= 
-                    signal_power >= (Gamma(i) + omega(i) * r) * interference;
+
+                    % SINR约束：确保索引不越界
+                    if i <= length(Gamma) && i <= length(omega)
+                        signal_power >= (Gamma(i) + omega(i) * r) * interference;
+                    end
                 end
                
                 %% 4. 感知MI约束
                 for k = 1:K
-                    sum_R = zeros(Nt, Nt);
-                    for n = 1:(C+M)
-                        sum_R = sum_R + R(:,:,n);
-                    end
                     
                     beam_gain = A_targets(:,k)' * sum_R * A_targets(:,k);
                     SINR_k_factor = Nr * sigma2_k(k) * L / sigma2_r;
@@ -867,6 +871,9 @@ function [R, feasible, cvx_info] = solve_complex_feasibility(...
                 
         cvx_end
         
+        % 处理求解结果
+        fprintf('    CVX求解状态: %s\n', cvx_status);
+
         % 处理求解结果 - 修复版本
         if strcmp(cvx_status, 'Solved')
             feasible = true;
@@ -1169,7 +1176,6 @@ function [W_opt_rank1, R_bar, success_rank1, construction_info] = construct_rank
 end
 
 %% 辅助函数
-
 function r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
     sigma2_c, sigma2_r, sigma2_k, alpha, omega, xi)
     
@@ -1177,7 +1183,7 @@ function r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
     comm_upper = 0;
     for i = 1:C
         % 计算最大SNR (所有功率分配给用户i，无干扰)
-        channel_gain = norm(h(:,i))^2;
+        channel_gain = norm(h(:,i))^2;  % 归一化信道增益
         max_SNR = PT * channel_gain / sigma2_c;
         
         % 计算加权通信速率上界
@@ -1199,18 +1205,17 @@ function r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
         max_beam_gain = PT * Nt^2;
         
         % 最大SINR计算
-        max_SINR_k = Nr * sigma2_k(k) * L * max_beam_gain / sigma2_r;
+        max_SINR_k = sigma2_k(k) * L * max_beam_gain / sigma2_r;
         
         % 计算单目标MI上界
         MI_upper_k = log2(1 + max_SINR_k);
-        weighted_MI_k = xi(k) * MI_upper_k;
         
-        sensing_upper = sensing_upper + weighted_MI_k;
+        sensing_upper = sensing_upper + MI_upper_k;
         
-        fprintf('  目标%d: 波束增益=%.0f, SINR_max=%.0e, MI_max=%.2f, 加权=%.2f\n', ...
-            k, max_beam_gain, max_SINR_k, MI_upper_k, weighted_MI_k);
+        fprintf('  目标%d: 波束增益=%.0f, SINR_max=%.0e, MI_max=%.2f\n', ...
+            k, max_beam_gain, max_SINR_k, MI_upper_k);
     end
-    
+    sensing_upper = alpha * sensing_upper;
     % 总的理论上界
     r_max = (comm_upper + sensing_upper);
     
@@ -1472,33 +1477,6 @@ function MI_upper = compute_sensing_MI_upper_bound(W_opt, theta_r, K, sigma2_k, 
     end
 end
 
-%% 验证函数：比较公式13和公式16的结果
-function compare_mi_formulas(W_opt, theta_r, K, sigma2_k, sigma2_r, Nr, L, d)
-% 比较精确公式(13)和上界公式(16)的结果
-    
-    fprintf('\n=== 感知互信息公式对比 ===\n');
-    
-    % 计算精确值 (公式13)
-    MI_exact = compute_sensing_MI_formula13(W_opt, theta_r, K, sigma2_k, sigma2_r, Nr, L, d);
-    
-    % 计算上界 (公式16)
-    MI_upper = compute_sensing_MI_upper_bound(W_opt, theta_r, K, sigma2_k, sigma2_r, Nr, L, d);
-    
-    fprintf('精确MI (公式13): %.6f bits\n', MI_exact);
-    fprintf('上界MI (公式16): %.6f bits\n', MI_upper);
-    fprintf('差值: %.6f bits\n', MI_upper - MI_exact);
-    fprintf('相对差异: %.2f%%\n', 100 * abs(MI_upper - MI_exact) / max(MI_exact, 1e-6));
-    
-    % 理论上，精确值应该小于等于上界
-    if MI_exact <= MI_upper + 1e-10
-        fprintf('✓ 验证通过: 精确值 ≤ 上界\n');
-    else
-        fprintf('⚠ 验证失败: 精确值 > 上界，可能存在数值误差\n');
-    end
-    
-    fprintf('========================\n\n');
-end
-
 
 %% 精确的通信速率计算（严格按照论文公式5-6）
 function rate = compute_communication_rate_accurate(W_opt, h, C, sigma2_c)
@@ -1567,6 +1545,8 @@ end
 
 %% 标准的莱斯信道生成
 function h = generate_rician_channel_standard(Nt, C, theta_c, rician_factor)
+    
+    % 生成标准莱斯衰落信道
     h = zeros(Nt, C);
     
     for i = 1:C
@@ -2037,6 +2017,13 @@ function [MI_convergence, rate_convergence, iterations] = ...
         fprintf('  当前区间: [%.6f, %.6f] (宽度=%.6f)\n', ...
             r_min, r_max, r_max - r_min);
         
+        % 在调用之前添加调试信息
+        fprintf('调用solve_complex_feasibility前的参数检查:\n');
+        fprintf('  C=%d, K=%d, M=%d\n', C, K, M);
+        fprintf('  omega长度=%d, xi长度=%d\n', length(omega), length(xi));
+        fprintf('  h矩阵尺寸=[%d x %d]\n', size(h,1), size(h,2));
+        fprintf('  theta_r长度=%d, sigma2_k长度=%d\n', length(theta_r), length(sigma2_k));
+
         % Step 3: 调用单次可行性求解
         [R_current, r_solved, solve_info] = solve_complex_convex_optimization(...
             alpha, omega, xi, h, theta_r, ...
@@ -2057,7 +2044,7 @@ function [MI_convergence, rate_convergence, iterations] = ...
             
             if rank1_success
                 % 计算当前性能指标
-                MI_current = compute_sensing_MI_accurate(...
+                MI_current = compute_sensing_MI(...
                     W_current, theta_r, K, sigma2_k, sigma2_r, Nr, L, d);
                 rate_current = compute_communication_rate_accurate(...
                     W_current, h, C, sigma2_c);
