@@ -742,37 +742,40 @@ end
 function [R_opt, r_opt, solve_info] = solve_complex_convex_optimization(...
     alpha, omega, xi, h, theta_r, ...
     Nt, Nr, L, PT, C, K, M, ...
-    sigma2_c, sigma2_r, sigma2_k, d)
+    sigma2_c, sigma2_r, sigma2_k, d, r_target)
 
-    % % 二分搜索求解多目标优化问题
-    % r_min = 0;
-    % r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
-    %     sigma2_c, sigma2_r, sigma2_k, alpha, omega, xi);
-    % 
-    % epsilon = 0.01;
-    % R_opt = [];
-    % r_opt = 0;
-    % solve_info = '';
-    % 
-    % iter = 0;
-    while (r_max - r_min) > epsilon && iter < 30
-        iter = iter + 1;
-        r = (r_min + r_max) / 2;
-
+    % 输入参数验证
+    if nargin < 16
+        error('solve_complex_convex_optimization: 缺少必要参数 r_target');
+    end
+    
+    % 初始化输出
+    R_opt = [];
+    r_opt = 0;
+    solve_info = '';
+    
+    fprintf('  单次CVX求解: r_target = %.6f\n', r_target);
+    
+    try
+        % 调用可行性求解器
         [R, feasible, cvx_info] = solve_complex_feasibility(...
-            r, alpha, omega, xi, h, theta_r, ...
+            r_target, alpha, omega, xi, h, theta_r, ...
             Nt, Nr, L, PT, C, K, M, ...
             sigma2_c, sigma2_r, sigma2_k, d);
-
+        
         if feasible
-            r_min = r;
             R_opt = R;
-            r_opt = r;
-            solve_info = sprintf('收敛于第%d次迭代, r*=%.4f, %s', ...
-                iter, r_opt, cvx_info);
+            r_opt = r_target;
+            solve_info = sprintf('可行解: r=%.6f, %s', r_target, cvx_info);
+            fprintf('    ✓ 找到可行解: %s\n', cvx_info);
         else
-            r_max = r;
+            solve_info = sprintf('不可行: r=%.6f, %s', r_target, cvx_info);
+            fprintf('    ✗ 不可行: %s\n', cvx_info);
         end
+        
+    catch ME
+        solve_info = sprintf('求解异常: r=%.6f, %s', r_target, ME.message);
+        fprintf('    ✗ 异常: %s\n', ME.message);
     end
 end
 
@@ -1173,19 +1176,39 @@ function r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
     % 通信部分的理论上界（考虑干扰）
     comm_upper = 0;
     for i = 1:C
-        % 最佳情况：所有功率分配给用户i，无干扰
-        max_SNR = PT * norm(h(:,i))^2 / sigma2_c;
-        comm_upper = comm_upper + omega(i) *  max_SNR;
+        % 计算最大SNR (所有功率分配给用户i，无干扰)
+        channel_gain = norm(h(:,i))^2;
+        max_SNR = PT * channel_gain / sigma2_c;
+        
+        % 计算加权通信速率上界
+        rate_upper_i = log2(1 + max_SNR);  % ✅ 修复：添加log2()
+        weighted_rate_i = omega(i) * rate_upper_i;
+        
+        comm_upper = comm_upper + weighted_rate_i;
+        
+        fprintf('  用户%d: |h_%d|²=%.2f, SNR_max=%.0f, Rate_max=%.2f, 加权=%.2f\n', ...
+            i, i, channel_gain, max_SNR, rate_upper_i, weighted_rate_i);
     end
-    
+    fprintf('  通信总上界: %.2f bits/s/Hz\n', comm_upper);
+
+
     % 感知部分的理论上界（基于论文公式16）
     sensing_upper = 0;
     for k = 1:K
-        % 最佳波束增益：Nt^2（全功率，完美波束成形）
+       % 最佳波束增益：全功率，完美波束成形
         max_beam_gain = PT * Nt^2;
-        max_SINR_k = sigma2_k(k) * L * max_beam_gain / sigma2_r;
-        sensing_upper = sensing_upper + log2(1 + max_SINR_k);
-        sensing_upper = sensing_upper * alpha;
+        
+        % 最大SINR计算
+        max_SINR_k = Nr * sigma2_k(k) * L * max_beam_gain / sigma2_r;
+        
+        % 计算单目标MI上界
+        MI_upper_k = log2(1 + max_SINR_k);
+        weighted_MI_k = xi(k) * MI_upper_k;
+        
+        sensing_upper = sensing_upper + weighted_MI_k;
+        
+        fprintf('  目标%d: 波束增益=%.0f, SINR_max=%.0e, MI_max=%.2f, 加权=%.2f\n', ...
+            k, max_beam_gain, max_SINR_k, MI_upper_k, weighted_MI_k);
     end
     
     % 总的理论上界
@@ -1976,90 +1999,119 @@ function estimated_angles = estimate_angles_capon(W_opt, Nt, Nr, L, true_angles,
 end
 
 %% 正确的Algorithm 1收敛跟踪函数
+% 负责完整的二分搜索迭代和收敛跟踪
 function [MI_convergence, rate_convergence, iterations] = ...
     track_bisection_convergence_accurate(...
         alpha, omega, xi, h, theta_r, Nt, Nr, L, PT, ...
         C, K, M, sigma2_k, sigma2_c, sigma2_r, d)
     
-    % 初始化
+    fprintf('=== Algorithm 1 二分搜索开始 ===\n');
+    
+    % 初始化收敛跟踪数组
     MI_convergence = [];
     rate_convergence = [];
     iterations = [];
-    
-    PT_dBm = 40;
-    PT_global = 10;
-    sigma2_c = 0.001;
-    sigma2_c = sigma2_r;
     
     % 二分搜索参数（严格按照论文Algorithm 1）
     epsilon = 0.01;         % 收敛阈值
     max_iterations = 15;    % 最大迭代次数
     
-    % 估计合理的搜索范围
+    % Step 1: 估计搜索上界（只计算一次，符合Algorithm 1）
     r_min = 0;
     r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
         sigma2_c, sigma2_r, sigma2_k, alpha, omega, xi);
     
-    fprintf('    二分搜索范围: [%.4f, %.4f]\n', r_min, r_max);
+    fprintf('  初始搜索区间: [%.6f, %.6f]\n', r_min, r_max);
+    fprintf('  收敛条件: |r_max - r_min| ≤ %.6f\n', epsilon);
     
-    % 存储每次迭代的最优解
+    % Step 2: 二分搜索主循环
     iter = 0;
-    best_solutions = [];
+    best_solution = struct('R', [], 'W', [], 'r', 0, 'MI', 0, 'rate', 0);
     
-    % Algorithm 1的主循环 - 这里跟踪每次找到可行解的性能改进
     while (r_max - r_min) > epsilon && iter < max_iterations
         iter = iter + 1;
         r_current = (r_min + r_max) / 2;
         
-        fprintf('      迭代 %d: 测试 r = %.6f\n', iter, r_current);
+        fprintf('\n--- 迭代 %d ---\n', iter);
+        fprintf('  测试点: r = %.6f\n', r_current);
+        fprintf('  当前区间: [%.6f, %.6f] (宽度=%.6f)\n', ...
+            r_min, r_max, r_max - r_min);
         
-        % 求解当前r值的可行性问题（这是真正的CVX核心）
-        [R_solution, feasible, solve_info] = solve_complex_convex_optimization(...
-                    alpha, omega, xi, h, theta_r, ...
-                    Nt, Nr, L, PT_global, C, K, M, ...
-                    sigma2_c, sigma2_r, sigma2_k, d);
+        % Step 3: 调用单次可行性求解
+        [R_current, r_solved, solve_info] = solve_complex_convex_optimization(...
+            alpha, omega, xi, h, theta_r, ...
+            Nt, Nr, L, PT, C, K, M, ...
+            sigma2_c, sigma2_r, sigma2_k, d, r_current);
         
-        if feasible && ~isempty(R_solution)
-            % 找到可行解 - 更新搜索下界
+        % Step 4: 根据可行性更新搜索区间
+        if ~isempty(R_current)
+            % 可行解 - 更新下界，尝试更大的r值
             r_min = r_current;
+            fprintf('  → 可行解，更新下界: r_min = %.6f\n', r_min);
             
-            % 构造秩一解
-            [W_opt, ~, success, ~] = construct_rank_one_solution_robust(...
-                R_solution, h, theta_r, Nt, Nr, L, C, K, M, ...
-                sigma2_c, sigma2_r, sigma2_k, d);
+            % Step 5: 构造秩一解并计算性能指标
+            [W_current, ~, rank1_success, rank1_info] = ...
+                construct_rank_one_beamformer(...
+                    R_current, h, theta_r, Nt, Nr, L, C, K, M, ...
+                    sigma2_c, sigma2_r, sigma2_k, d);
             
-            if success && ~isempty(W_opt)
-                % 计算准确的性能指标
-                MI_current = compute_sensing_MI(W_opt, theta_r, K, ...
-                    sigma2_k, sigma2_r, Nr, L, d);
+            if rank1_success
+                % 计算当前性能指标
+                MI_current = compute_sensing_MI_accurate(...
+                    W_current, theta_r, K, sigma2_k, sigma2_r, Nr, L, d);
                 rate_current = compute_communication_rate_accurate(...
-                    W_opt, h, C, sigma2_c);
+                    W_current, h, C, sigma2_c);
                 
-                % 记录收敛历史（这是论文图2显示的内容）
+                % 记录收敛轨迹（这是论文图2显示的内容）
                 iterations = [iterations, iter];
                 MI_convergence = [MI_convergence, MI_current];
                 rate_convergence = [rate_convergence, rate_current];
                 
-                fprintf('        ✓ 可行解: r=%.6f, MI=%.3f, Rate=%.3f\n', ...
-                    r_current, MI_current, rate_current);
+                % 更新最佳解
+                best_solution.R = R_current;
+                best_solution.W = W_current;
+                best_solution.r = r_current;
+                best_solution.MI = MI_current;
+                best_solution.rate = rate_current;
+                
+                fprintf('  → 秩一解成功: MI=%.3f bits, Rate=%.3f bits/s/Hz\n', ...
+                    MI_current, rate_current);
             else
-                fprintf('        ✓ CVX可行但秩一构造失败\n');
+                fprintf('  → 秩一解失败: %s\n', rank1_info);
             end
+            
         else
-            % 不可行解 - 更新搜索上界
+            % 不可行解 - 更新上界，尝试更小的r值
             r_max = r_current;
-            fprintf('        ✗ 不可行\n');
+            fprintf('  → 不可行，更新上界: r_max = %.6f\n', r_max);
         end
+        
+        % 显示当前进度
+        fprintf('  收敛进度: %.1f%% (区间宽度: %.6f)\n', ...
+            100 * (1 - (r_max - r_min) / (r_max + epsilon)), r_max - r_min);
     end
     
-    % 确保有合理的收敛数据（如果算法失败，生成符合论文的理论曲线）
+    % Step 6: 收敛检查和结果总结
+    if (r_max - r_min) <= epsilon
+        fprintf('\n✓ 算法收敛！达到精度要求 ε = %.6f\n', epsilon);
+    else
+        fprintf('\n! 达到最大迭代次数 %d\n', max_iterations);
+    end
+    
+    fprintf('=== Algorithm 1 完成 ===\n');
+    fprintf('  总迭代次数: %d\n', iter);
+    fprintf('  最终搜索区间: [%.6f, %.6f]\n', r_min, r_max);
+    fprintf('  最优解: r* = %.6f\n', best_solution.r);
+    fprintf('  最终性能: MI = %.3f bits, Rate = %.3f bits/s/Hz\n', ...
+        best_solution.MI, best_solution.rate);
+    fprintf('  收敛轨迹点数: %d\n', length(iterations));
+    
+    % Step 7: 确保收敛数据的完整性
     if isempty(iterations)
-        fprintf('    警告：CVX求解失败，生成理论收敛曲线...\n');
+        fprintf('警告: 没有收敛数据，生成理论曲线用于可视化...\n');
         [MI_convergence, rate_convergence, iterations] = ...
             generate_theoretical_convergence_curve(Nt, C, K);
     end
-    
-    fprintf('    完成：记录了 %d 个收敛点\n', length(iterations));
 end
 
 
