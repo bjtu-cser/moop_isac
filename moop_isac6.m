@@ -1,10 +1,6 @@
-%% 完整的MIMO-ISAC多目标优化仿真框架
-% 基于MOOP_ISAC3.m的CVX优化核心 + 论文第V节所有实验
-% 
-% 包含真正的CVX凸优化求解和Pareto边界计算
-% 实现论文中的所有对比方法和实验场景
-
+%% MIMO-ISAC多目标优化仿真框架
 clear; close all; clc;
+cvx_setup
 
 %% 全局参数设置
 global PT_global;
@@ -95,7 +91,7 @@ function run_convergence_analysis()
     sigma2_k = ones(K,1);           % 目标反射系数
     
     % 固定权重配置（论文使用平衡权重）？
-    alpha = 0.5;                    % 感知权重
+    alpha = 0.4;                    % 感知权重
     omega = (1-alpha)/C * ones(C,1); % 通信权重
     xi = alpha/K * ones(K,1);       % 目标权重
     
@@ -123,11 +119,9 @@ function run_convergence_analysis()
         h = generate_rician_channel_standard(Nt, C, theta_c, mu);
         
         % 显示信道信息
-        channel_gains = zeros(C,1);
-        for i = 1:C
-            %
-            channel_gains(i) = norm(h(:,i))^2;
-        end
+        channel_gains = sum(abs(h).^2, 1)'; % 假设 h 中的元素可能为复数
+        % 或者从 R2017b 版本开始，可以使用 vecnorm 更简洁：
+        % channel_gains = vecnorm(h).^2'; 
         fprintf('  信道增益: [%.2f, %.2f]\n', channel_gains);
         
         % 正确的收敛性分析：跟踪Algorithm 1的真实收敛过程
@@ -172,7 +166,7 @@ function run_convergence_analysis()
     legend('Location', 'southeast', 'FontSize', 11);
     grid on;
     xlim([1, 12]);  % 论文观察到平均5次迭代收敛
-    ylim([0, 20]);  % 根据论文图2调整
+    ylim([20, 40]);  % 根据论文图2调整
     set(gca, 'FontSize', 11);
     
     % 格式化图2(b)：通信速率 vs 迭代次数  
@@ -183,7 +177,7 @@ function run_convergence_analysis()
     legend('Location', 'southeast', 'FontSize', 11);
     grid on;
     xlim([1, 12]);
-    ylim([0, 10]);  % 根据论文图2调整
+    ylim([0, 12]);  % 根据论文图2调整
     set(gca, 'FontSize', 11);
     
     % 添加整体标题
@@ -737,15 +731,16 @@ function run_rmse_analysis()
     fprintf('RMSE分析完成\n');
 end
 
-%% 核心优化求解函数
+%% 核心优化求解函数 (修正版)
 function [R_opt, r_opt, solve_info] = solve_complex_convex_optimization(...
     alpha, omega, xi, h, theta_r, ...
     Nt, Nr, L, PT, C, K, M, ...
-    sigma2_c, sigma2_r, sigma2_k, d, r_target)
+    sigma2_c, sigma2_r, sigma2_k, d, r_target, ...
+    Gamma_min_linear, Lambda_min) % <-- 新增两个参数
 
-    % 输入参数验证
-    if nargin < 16
-        error('solve_complex_convex_optimization: 缺少必要参数 r_target');
+    % 输入参数验证 (nargin 是输入参数的个数)
+    if nargin < 19 % <-- 将这里的数目检查更新为19
+        error('solve_complex_convex_optimization: 缺少必要的参数 Gamma_min_linear 或 Lambda_min');
     end
     
     % 初始化输出
@@ -756,11 +751,12 @@ function [R_opt, r_opt, solve_info] = solve_complex_convex_optimization(...
     fprintf('  单次CVX求解: r_target = %.6f\n', r_target);
     
     try
-        % 调用可行性求解器
+        % 调用可行性求解器，并传入所有19个参数
         [R, feasible, cvx_info] = solve_complex_feasibility(...
             r_target, alpha, omega, xi, h, theta_r, ...
             Nt, Nr, L, PT, C, K, M, ...
-            sigma2_c, sigma2_r, sigma2_k, d);
+            sigma2_c, sigma2_r, sigma2_k, d, ...
+            Gamma_min_linear, Lambda_min); % <-- 将新增的参数传递下去
         
         if feasible
             R_opt = R;
@@ -778,161 +774,159 @@ function [R_opt, r_opt, solve_info] = solve_complex_convex_optimization(...
     end
 end
 
-function [R, feasible, cvx_info] = solve_complex_feasibility(...
+
+function [R_out, is_feasible, cvx_status_text] = solve_complex_feasibility(...
     r, alpha, omega, xi, h, theta_r, ...
     Nt, Nr, L, PT, C, K, M, ...
-    sigma2_c, sigma2_r, sigma2_k, d)
-    
-    % 初始化输出参数（重要：防止未赋值错误）
-    R = [];
-    feasible = false;
-    cvx_info = '';
+    sigma2_c, sigma2_r, sigma2_k, d, Gamma_min_linear, Lambda_min)
+% SOLVE_COMPLEX_FEASIBILITY 解决论文（公式37）中的可行性问题
+% 此版本包含稳健的输入验证，以防止CVX中的数据类型错误
+%
+% 输入:
+%   r                - 二分搜索中当前测试的值
+%   alpha, omega, xi - 感知和通信的权重因子
+%   h                - 通信信道矩阵 [Nt x C]
+%   theta_r          - 雷达目标角度 [K x 1]，单位为弧度
+%   Nt, Nr, L        - 系统参数（天线数、信号长度）
+%   PT               - 总发射功率（线性值）
+%   C, K, M          - 用户数、目标数、专用雷达流数量
+%   sigma2_c, sigma2_r - 噪声方差（线性值）
+%   sigma2_k         - 目标反射系数 [K x 1]
+%   d                - 天线间距（以波长为单位，例如0.5）
+%   Gamma_min_linear - 用户最小SINR要求（线性值，例如 10^(5/10)）
+%   Lambda_min       - 最小总感知互信息要求（单位 bits）
+%
+% 输出:
+%   R_out            - 求解得到的协方差矩阵{R_n}（3D数组），如果不可行则为[]
+%   is_feasible      - 布尔标志（如果找到解则为true）
+%   cvx_status_text  - 描述求解器退出状态的字符串
 
+    %% 1. 输入验证与类型转换 (关键修正)
+    % 此代码块确保所有数值输入在使用前都为'double'类型
     try
-        % 参数验证和调试信息
-        fprintf('  CVX求解参数: Nt=%d, C=%d, K=%d, M=%d, r=%.4f\n', Nt, C, K, M, r);
-
-        % 预计算复数导向矢量
-        A_targets = zeros(Nt, K);
-        for k = 1:K
-            A_targets(:,k) = exp(1j*2*pi*d*(0:Nt-1)'*sin(theta_r(k)));
+        % --- 确保标量参数是数值double类型 ---
+        scalar_params = {Nt, Nr, L, PT, C, K, M, sigma2_c, sigma2_r, d, r, alpha, Lambda_min};
+        for i = 1:length(scalar_params)
+            if ~isnumeric(scalar_params{i}) || ~isscalar(scalar_params{i})
+                error('参数 #%d 不是一个数值标量。', i);
+            end
         end
-        
-        % CVX优化求解 - 完全兼容版本
+        Nt = double(Nt); Nr = double(Nr); L = double(L); PT = double(PT);
+        C = double(C); K = double(K); M = double(M);
+        sigma2_c = double(sigma2_c); sigma2_r = double(sigma2_r); d = double(d);
+        r = double(r); alpha = double(alpha); Lambda_min = double(Lambda_min);
+
+        % --- 确保向量/矩阵参数是数值类型且尺寸正确 ---
+        h = double(h); theta_r = double(theta_r); omega = double(omega);
+        xi = double(xi); sigma2_k = double(sigma2_k); Gamma_min_linear = double(Gamma_min_linear);
+
+        % 维度检查
+        assert(size(h, 1) == Nt && size(h, 2) == C, '信道矩阵h维度不匹配。');
+        assert(length(theta_r) == K, '目标角度theta_r维度不匹配。');
+        assert(length(omega) == C, '通信权重omega维度不匹配。');
+        assert(length(xi) == K, '感知权重xi维度不匹配。');
+        assert(length(sigma2_k) == K, '反射系数sigma2_k维度不匹配。');
+        assert(length(Gamma_min_linear) == C, 'SINR阈值Gamma_min_linear维度不匹配。');
+
+    catch ME
+        % 如果验证失败，报告错误并安全退出
+        is_feasible = false;
+        R_out = [];
+        cvx_status_text = sprintf('输入验证失败: %s', ME.message);
+        fprintf('输入验证期间出错: %s\n', ME.message);
+        return;
+    end
+
+    %% 2. 预计算
+    % 预先计算目标导向矢量以提高效率
+    A_r = zeros(Nt, K);
+    for k = 1:K
+        A_r(:,k) = exp(1j * 2 * pi * d * (0:Nt-1)' * sin(theta_r(k)));
+    end
+
+    % 为松弛的零相关约束设置一个很小的容忍值
+    kappa = 1e-6;
+    
+    cvx_clear
+    %% 3. CVX 凸可行性问题
+    try
         cvx_begin sdp quiet
             cvx_precision default
-            
-            % 声明复数厄米特半正定矩阵变量
-            variable R(Nt, Nt, C+M) complex hermitian semidefinite
-            
-            minimize(0)  % 可行性问题
-            
-            sum_R = zeros(Nt, Nt);
-            for n = 1:(C+M)
-                sum_R = sum_R + R(:,:,n);
-            end
+
+            % 将 C+M 个协方差矩阵声明为一个3D数组
+            variable R(Nt, Nt, C+M) hermitian semidefinite
+
+            % 用于计算协方差矩阵之和的辅助变量
+            R_sum = sum(R, 3);
+
+            % 这是一个可行性问题，因此目标函数为常数
+            minimize(0)
 
             subject to
-                %% 1. 功率约束
-                total_power = 0;
-                for n = 1:(C+M)
-                    total_power = total_power + trace(R(:,:,n));
-                end
-                total_power <= PT;
-                
-                %% 2. 零强制交叉相关约束
-                kappa = 1e-6 * PT;
-                
-                for i = 1:K
-                    for j = 1:K
-                        if i ~= j
-                            cross_corr = A_targets(:,j)' * sum_R * A_targets(:,i);
-                            norm(cross_corr) <= kappa;
-                        end
-                    end
-                end
-                
-                %% 3. 通信SINR约束  r_i >= Gamma_i + w_i * r
-                
-                Gamma_dB = 5;  % 所有用户使用相同的SINR阈值 5dB
-                Gamma = 10^(Gamma_dB/10) * ones(C, 1);  % 转换为线性值并创建C个元素的数组
-                for i = 1:min(C, size(h, 2))
-                    % 计算信号功率: h_i^H R_i h_i
-                    signal_power = real(h(:,i)' * R(:,:,i) * h(:,i));
-                    
-                    % 计算干扰功率: ∑_{j≠i} h_i^H R_j h_i + 噪声功率
-                    interference = sigma2_c;
-                    for j = 1:(C+M)
-                        if j ~= i
-                            interference = interference + real(h(:,i)' * R(:,:,j) * h(:,i));
-                        end
-                    end
+                % a) 总功率约束 (论文公式 26a) 
+                real(trace(R_sum)) <= PT;
 
-                    % SINR约束：确保索引不越界
-                    if i <= length(Gamma) && i <= length(omega)
-                        signal_power >= (Gamma(i) + omega(i) * r) * interference;
+                % b) 零强制交叉相关约束 (论文公式 26b, 松弛版) 
+                % 这使得互信息上界更紧 (论文公式 17) 
+                for i_k = 1:K
+                    for j_k = (i_k + 1):K % 避免冗余检查
+                        cross_corr = A_r(:, j_k)' * R_sum * A_r(:, i_k);
+                        norm(cross_corr) <= kappa;
                     end
                 end
-               
-                %% 4. 感知MI约束
+
+                % c) 通信SINR约束 (论文公式 36c) 
+                for i_c = 1:C
+                    signal_power = real(h(:, i_c)' * R(:, :, i_c) * h(:, i_c));
+
+                    interference_power = sigma2_c;
+                    for j_n = 1:(C+M)
+                        if j_n ~= i_c
+                            interference_power = interference_power + ...
+                                real(h(:, i_c)' * R(:, :, j_n) * h(:, i_c));
+                        end
+                    end
+                    
+                    % 此用户的目标SINR
+                    target_sinr = Gamma_min_linear(i_c) + omega(i_c) * r;
+                    signal_power >= target_sinr * interference_power;
+                end
+
+                % d) 感知互信息约束 (论文公式 37b) 
+                % log(1+SINR_k) >= xi_k * (Lambda_min + alpha*r)
+                % CVX的log()是自然对数，所以我们将右侧乘以log(2)
+                target_mi_val = Lambda_min + alpha * r;
                 for k = 1:K
+                    beam_gain = real(A_r(:, k)' * R_sum * A_r(:, k));
+                    sensing_sinr_k = (Nr * L * sigma2_k(k) / sigma2_r) * beam_gain;
                     
-                    beam_gain = A_targets(:,k)' * sum_R * A_targets(:,k);
-                    SINR_k_factor = Nr * sigma2_k(k) * L / sigma2_r;
-                    SINR_k = SINR_k_factor * beam_gain;
-                    
-                    rhs = xi(k) * alpha * r * log(2);
-                    if rhs < 10
-                        1 + SINR_k >= exp(rhs);
-                    else
-                        log(SINR_k) >= rhs;
-                    end
+                    % 这是一个凸约束 log(1+x) >= y
+                    log(1 + sensing_sinr_k) >= 1/K * target_mi_val * log(2);
                 end
-                
-        cvx_end
-        
-        % 处理求解结果
-        fprintf('    CVX求解状态: %s\n', cvx_status);
 
-        % 处理求解结果 - 修复版本
-        if strcmp(cvx_status, 'Solved')
-            feasible = true;
-            % 计算实际功率使用情况
-            if ~isempty(R)
-                sum_R = sum(R, 3);
-                actual_power = real(trace(sum_R));
-                cvx_info = sprintf('已求解, 功率=%.1f%% (%.2fW)', ...
-                    100*actual_power/PT, actual_power);
-            else
-                cvx_info = '已求解, 但R为空';
-            end
-            
-        elseif strcmp(cvx_status, 'Inaccurate/Solved')
-            feasible = true;  % 仍然接受不精确解
-            if ~isempty(R)
-                sum_R = sum(R, 3);
-                actual_power = real(trace(sum_R));
-                cvx_info = sprintf('不精确解, 功率=%.1f%% (%.2fW)', ...
-                    100*actual_power/PT, actual_power);
-            else
-                cvx_info = '不精确解, 但R为空';
-            end
-            
-        elseif strcmp(cvx_status, 'Infeasible')
-            feasible = false;
-            R = [];
-            cvx_info = sprintf('不可行, r=%.4f', r);
-            
-        elseif strcmp(cvx_status, 'Failed')
-            feasible = false;
-            R = [];
-            cvx_info = sprintf('求解失败: %s, r=%.4f', cvx_status, r);
-            
-        elseif strcmp(cvx_status, 'Unbounded')
-            feasible = false;
-            R = [];
-            cvx_info = sprintf('无界问题, r=%.4f', r);
-            
+        cvx_end
+
+        %% 4. 处理CVX结果
+        if contains(cvx_status, 'Solved')
+            is_feasible = true;
+            R_out = R;
+            cvx_status_text = cvx_status;
         else
-            % 处理其他未知状态
-            feasible = false;
-            R = [];
-            cvx_info = sprintf('未知CVX状态: %s, r=%.4f', cvx_status, r);
+            is_feasible = false;
+            R_out = [];
+            cvx_status_text = cvx_status;
         end
-        
+
     catch ME
-        % 捕获任何异常
-        feasible = false;
-        R = [];
-        cvx_info = sprintf('异常: %s, r=%.4f', ME.message, r);
-        fprintf('solve_complex_feasibility异常: %s\n', ME.message);
-    end
-    
-    % 最终验证所有输出参数都有值
-    if isempty(cvx_info)
-        cvx_info = sprintf('未知状态, r=%.4f', r);
+        % 捕获CVX执行期间的任何意外错误
+        is_feasible = false;
+        R_out = [];
+        cvx_status_text = sprintf('CVX执行错误: %s', ME.message);
+        fprintf('CVX执行期间出错: %s\n', ME.message);
     end
 end
+
+
 
 function [W_opt_rank1, R_bar, success_rank1, construction_info] = construct_rank_one_beamformer(R_opt, h, theta_r, Nt, Nr, L, C, K, M, sigma2_c, sigma2_r, sigma2_k, d)
 % CONSTRUCT_PAPER_RANK_ONE_SOLUTION 根据论文Theorem 2构造秩一解
@@ -1179,21 +1173,35 @@ end
 function r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
     sigma2_c, sigma2_r, sigma2_k, alpha, omega, xi)
     
+    fprintf('--- Checking Parameters ---\n');
+    fprintf('alpha:        %.4f\n', alpha);
+    fprintf('omega:       [ '); fprintf('%.4f ', omega); fprintf(']\n');
+    fprintf('xi:          [ '); fprintf('%.4f ', xi); fprintf(']\n');
+    fprintf('Size of h:   %d x %d (Nt x C = %d x %d)\n', size(h,1), size(h,2), Nt, C);
+    fprintf('Nt, Nr:      %d, %d\n', Nt, Nr);
+    fprintf('L:           %d\n', L);
+    fprintf('PT:          %.4f\n', PT);
+    fprintf('C, K :     %d, %d, %d\n', C, K);
+    fprintf('sigma2_c:    %.6f\n', sigma2_c);
+    fprintf('sigma2_r:    %.6f\n', sigma2_r);
+    fprintf('sigma2_k:    [ '); fprintf('%.4f ', sigma2_k); fprintf(']\n');
+    fprintf('--- End of Parameter Check ---\n\n');
+
     % 通信部分的理论上界（考虑干扰）
     comm_upper = 0;
     for i = 1:C
         % 计算最大SNR (所有功率分配给用户i，无干扰)
-        channel_gain = norm(h(:,i))^2;  % 归一化信道增益
+        channel_gain = h(:, i)' * h(:, i);  % 归一化信道增益
         max_SNR = PT * channel_gain / sigma2_c;
         
         % 计算加权通信速率上界
         rate_upper_i = log2(1 + max_SNR);  % ✅ 修复：添加log2()
         weighted_rate_i = omega(i) * rate_upper_i;
-        
+
         comm_upper = comm_upper + weighted_rate_i;
         
-        fprintf('  用户%d: |h_%d|²=%.2f, SNR_max=%.0f, Rate_max=%.2f, 加权=%.2f\n', ...
-            i, i, channel_gain, max_SNR, rate_upper_i, weighted_rate_i);
+        fprintf('  用户%d: |h_%d|²=%.2f, SNR_max=%.0f,通信上界=%.2f, 加权=%.2f\n', ...
+            i, i, channel_gain, max_SNR,comm_upper , weighted_rate_i);
     end
     fprintf('  通信总上界: %.2f bits/s/Hz\n', comm_upper);
 
@@ -1208,7 +1216,7 @@ function r_max = estimate_accurate_r_max(h, PT, C, K, Nt, Nr, L, ...
         max_SINR_k = sigma2_k(k) * L * max_beam_gain / sigma2_r;
         
         % 计算单目标MI上界
-        MI_upper_k = log2(1 + max_SINR_k);
+        MI_upper_k = log(1 + max_SINR_k);
         
         sensing_upper = sensing_upper + MI_upper_k;
         
@@ -1985,6 +1993,11 @@ function [MI_convergence, rate_convergence, iterations] = ...
         alpha, omega, xi, h, theta_r, Nt, Nr, L, PT, ...
         C, K, M, sigma2_k, sigma2_c, sigma2_r, d)
     
+    % 为通信和感知定义最低性能门限 (与论文 V.B 节一致)
+    Gamma_min_dB = 5;     % 5 dB SINR 约束
+    Gamma_min_linear = 10^(Gamma_min_dB/10) * ones(C, 1); % 转换为线性值
+    Lambda_min = 10;      % 10 bits MI 门限
+    
     fprintf('=== Algorithm 1 二分搜索开始 ===\n');
     
     % 初始化收敛跟踪数组
@@ -2028,7 +2041,8 @@ function [MI_convergence, rate_convergence, iterations] = ...
         [R_current, r_solved, solve_info] = solve_complex_convex_optimization(...
             alpha, omega, xi, h, theta_r, ...
             Nt, Nr, L, PT, C, K, M, ...
-            sigma2_c, sigma2_r, sigma2_k, d, r_current);
+            sigma2_c, sigma2_r, sigma2_k, d, r_current, ...
+            Gamma_min_linear, Lambda_min);
         
         % Step 4: 根据可行性更新搜索区间
         if ~isempty(R_current)
